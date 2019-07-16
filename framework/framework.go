@@ -1,9 +1,12 @@
 package framework
 
 import (
+    "fmt"
     "github.com/onsi/ginkgo"
     "github.com/onsi/gomega"
+    "k8s.io/apimachinery/pkg/api/errors"
     "k8s.io/apimachinery/pkg/runtime/schema"
+    "strings"
 
     "k8s.io/api/core/v1"
     "k8s.io/client-go/dynamic"
@@ -64,10 +67,62 @@ func (f *Framework) BeforeEach() {
     }
 
     if !f.SkipNamespaceCreation {
-        ns, err := f.Create
+        ns, err := f.CreateNamespace(f.BaseName, map[string]string{
+            "e2e-framework": f.BaseName,
+        })
+        gomega.Expect(err).NotTo(gomega.HaveOccurred(), "failed to create namespace")
+        ginkgo.By(fmt.Sprintf("Create namespace %s successfully", ns.Name))
+
+        f.Namespace = ns
     }
 }
 
-func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (*v1.Namespace, error) {
-    ns, err :=
+func (f *Framework) AfterEach()  {
+    defer func() {
+        nsDeletionErrors := map[string]error{}
+
+        if TestContext.DeleteNamespace && (TestContext.DeleteNamespaceOnFailure || !ginkgo.CurrentGinkgoTestDescription().Failed) {
+            for _, ns := range f.namespacesToDelete {
+                ginkgo.By(fmt.Sprintf("Destroying namespace %q for this suite", ns.Name))
+                if err := deleteNS(f.ClientSet, f.DynamicClient, ns.Name, DefaultNamespaceDeletionTimeout); err != nil {
+                    if !errors.IsNotFound(err) {
+                        nsDeletionErrors[ns.Name] = err
+                    } else {
+                        Logf("Namespace %v was already deleted", ns.Name)
+                    }
+                }
+            }
+        } else {
+            if !TestContext.DeleteNamespace {
+                Logf("Found DeleteNamespace=false, skipping namespace deletion!")
+            } else {
+                Logf("Found DeleteNamespaceOnFailure=false and current test failed, skipping namespace deletion!")
+            }
+        }
+
+        f.Namespace = nil
+        f.ClientSet = nil
+        f.namespacesToDelete = nil
+
+        if len(nsDeletionErrors) > 0 {
+            messages := []string{}
+            for namespaceKey, namespaceErr := range nsDeletionErrors {
+                messages = append(messages, fmt.Sprintf("Couldn't delete ns: %q: %s (%#v)", namespaceKey, namespaceErr, namespaceErr))
+            }
+            ginkgo.Fail(strings.Join(messages, ","))
+        }
+    }()
 }
+
+func (f *Framework) CreateNamespace(baseName string, labels map[string]string) (*v1.Namespace, error) {
+    ns, err := CreateTestingNS(f.BaseName, f.ClientSet, labels)
+
+    // check ns instead of error or see if its nil as we may
+    // fail to create serviceaccount in it.
+    // In this case. we should not forget to delete the namespace
+    if ns != nil {
+        f.namespacesToDelete = append(f.namespacesToDelete, ns)
+    }
+    return ns, err
+}
+
